@@ -1,0 +1,198 @@
+"""
+Error detector — consumes terminal lines and groups them into error events.
+Does NOT call LLM. Pure deterministic pattern matching.
+Maintains a rolling buffer to capture complete stack traces.
+"""
+from __future__ import annotations
+import asyncio
+import logging
+import re
+from collections import deque
+from typing import Callable, Deque, List, Optional
+
+from app.terminal.event import EventType, LogLevel, NormalizedError, TerminalEvent
+from app.terminal.error_patterns import detect_level, is_stacktrace_start, extract_exit_code
+
+logger = logging.getLogger(__name__)
+
+BUFFER_MAX_LINES = 60      # Max lines to accumulate for a single error event
+FLUSH_IDLE_SECS  = 0.35    # Fast flush buffer (350ms idle)
+
+
+class ErrorDetector:
+    """
+    Stateful error detector for one terminal session.
+
+    Usage:
+        detector = ErrorDetector(session_id, on_error_callback)
+        await detector.feed_line(raw_line)
+    """
+
+    def __init__(self, session_id: str, on_error: Callable[[NormalizedError], None]):
+        self.session_id = session_id
+        self._on_error  = on_error
+        self._buffer:   Deque[str] = deque(maxlen=BUFFER_MAX_LINES)
+        self._in_error: bool = False
+        self._flush_task: Optional[asyncio.Task] = None
+
+    async def feed_line(self, line: str) -> LogLevel:
+        """
+        Feed one line of terminal output.
+        Returns detected LogLevel.
+        """
+        level = detect_level(line)
+        is_trace = is_stacktrace_start(line)
+
+        # 1. New error or stack trace start
+        if level == "ERROR" or is_trace:
+            self._buffer.append(line)
+            self._in_error = True
+            await self._reschedule_flush()
+            return LogLevel.ERROR
+
+        # 2. If currently capturing a multiline error/stacktrace
+        if self._in_error:
+            # Continuation lines in stack traces are indented or contain file/trace patterns
+            is_continuation = (
+                line.startswith((" ", "\t", "  "))
+                or "File " in line
+                or " at " in line
+                or "Exception" in line
+                or "Error" in line
+                or not line.strip()
+            )
+            if is_continuation:
+                self._buffer.append(line)
+                await self._reschedule_flush()
+                return LogLevel.ERROR
+            else:
+                # Normal unindented log line arrived (e.g. INFO / GET 200) -> stack trace has finished!
+                await self._flush_error()
+
+        # 3. Check for abnormal process exit
+        exit_code = extract_exit_code(line)
+        if exit_code is not None and exit_code != 0:
+            self._buffer.append(line)
+            await self._flush_error()
+            return LogLevel.ERROR
+
+        if level == "WARN":
+            return LogLevel.WARN
+
+        return LogLevel.INFO
+
+    async def _reschedule_flush(self) -> None:
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+        self._flush_task = asyncio.create_task(self._delayed_flush())
+
+    async def _delayed_flush(self) -> None:
+        try:
+            await asyncio.sleep(FLUSH_IDLE_SECS)
+            await self._flush_error()
+        except asyncio.CancelledError:
+            pass
+
+    async def _flush_error(self) -> None:
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+            self._flush_task = None
+
+        if not self._buffer:
+            self._in_error = False
+            return
+
+        raw = "\n".join(self._buffer)
+        self._buffer.clear()
+        self._in_error = False
+
+        normalized = _normalize_error(raw, self.session_id)
+        try:
+            if asyncio.iscoroutinefunction(self._on_error):
+                await self._on_error(normalized)
+            else:
+                self._on_error(normalized)
+        except Exception as exc:
+            logger.warning(f"[ErrorDetector] on_error callback raised: {exc}")
+
+
+# ── Normalization helpers ──────────────────────────────────────────────────────
+
+_PY_ERROR_RE   = re.compile(r'^([A-Za-z][A-Za-z0-9_.]*(?:Error|Exception|Warning)):\s*(.*)', re.M)
+_JS_ERROR_RE   = re.compile(r'^([A-Za-z][A-Za-z0-9]*(?:Error|Exception)):\s*(.*)', re.M)
+_FILE_LINE_RE  = re.compile(r'(?:File|file)\s+"?([^":\n]+)"?,?\s+line\s+(\d+)', re.M)
+_AT_LINE_RE    = re.compile(r'at\s+[^\(]*\(?([^:\)\s]+):(\d+)(?::\d+)?\)?', re.M)
+
+
+def _detect_language(raw: str) -> Optional[str]:
+    if "Traceback (most recent call last)" in raw or ".py" in raw:
+        return "python"
+    if "at Object.<anonymous>" in raw or "at Module." in raw or "npm ERR" in raw or ".js" in raw:
+        return "javascript"
+    if "goroutine" in raw and "panic:" in raw:
+        return "go"
+    if "at " in raw and ".ts:" in raw:
+        return "typescript"
+    return None
+
+
+def _normalize_error(raw: str, session_id: str) -> NormalizedError:
+    lang = _detect_language(raw)
+    error_type = None
+    error_msg  = ""
+    file_path  = None
+    line_num   = None
+
+    # In Python tracebacks, the actual error is on the last line matching Error: message
+    for pattern in [_PY_ERROR_RE, _JS_ERROR_RE]:
+        matches = pattern.findall(raw)
+        if matches:
+            # Use the last error line as it's the actual unhandled exception
+            error_type, error_msg = matches[-1]
+            error_msg = error_msg.strip()
+            break
+
+    # Extract the innermost stack frame (the last File / line match)
+    file_matches = _FILE_LINE_RE.findall(raw) or _AT_LINE_RE.findall(raw)
+    if file_matches:
+        file_path, l_str = file_matches[-1]
+        try:
+            line_num = int(l_str)
+        except ValueError:
+            pass
+
+    if not error_msg:
+        # Fallback to first line with ERROR
+        first_error_line = next(
+            (l for l in raw.splitlines() if detect_level(l) == "ERROR"), raw.splitlines()[0]
+        )
+        error_msg = first_error_line.strip()[:300]
+        if not error_type:
+            if "500" in error_msg:
+                error_type = "HTTP500InternalServerError"
+            elif "Connection refused" in error_msg or "ECONNREFUSED" in error_msg:
+                error_type = "ConnectionRefusedError"
+            elif "OOMKilled" in raw or "137" in raw:
+                error_type = "OutOfMemoryError"
+            else:
+                error_type = "RuntimeError"
+
+    # Determine severity
+    raw_lower = raw.lower()
+    if any(k in raw_lower for k in ["oomkilled", "fatal", "panic:", "segmentation fault", "critical", "killed"]):
+        severity = "CRITICAL"
+    elif any(k in raw_lower for k in ["error", "exception", "traceback", "500"]):
+        severity = "HIGH"
+    else:
+        severity = "MEDIUM"
+
+    return NormalizedError(
+        session_id=session_id,
+        language=lang,
+        error_type=error_type,
+        error_message=error_msg,
+        file_path=file_path,
+        line_number=line_num,
+        raw_stack_trace=raw,
+        severity=severity,
+    )
