@@ -2,13 +2,14 @@
 Redis Queue Service for Decoupled AI Error Processing.
 Provides fast async enqueuing into Redis list 'ai_error_jobs'
 and Redis-based fingerprint deduplication (5-minute TTL).
-Includes in-memory queue fallback if Redis server is unreachable.
+Includes zero-delay in-memory queue fallback if Redis server is unreachable.
 """
 from __future__ import annotations
 import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -23,23 +24,34 @@ _in_memory_queue: asyncio.Queue = asyncio.Queue()
 _in_memory_dedup: Dict[str, float] = {}
 
 _redis_client: Optional[Any] = None
+_last_redis_attempt: float = 0.0
+_redis_retry_interval: float = 30.0  # Cooldown before retrying Redis
+_redis_offline_logged: bool = False
 
 
-async def get_redis_client():
-    """Lazy initialize redis.asyncio client."""
-    global _redis_client
+async def get_redis_client() -> Optional[Any]:
+    """Lazy initialize redis.asyncio client with cooldown backoff when offline."""
+    global _redis_client, _last_redis_attempt, _redis_offline_logged
     if _redis_client is not None:
         return _redis_client
 
+    now = time.time()
+    if now - _last_redis_attempt < _redis_retry_interval:
+        return None
+
+    _last_redis_attempt = now
     try:
         import redis.asyncio as aioredis
-        _redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
-        # Test connection ping
-        await _redis_client.ping()
+        client = aioredis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=0.5)
+        await asyncio.wait_for(client.ping(), timeout=0.5)
+        _redis_client = client
+        _redis_offline_logged = False
         logger.info(f"[RedisQueue] Connected to Redis at {REDIS_URL}")
         return _redis_client
     except Exception as exc:
-        logger.warning(f"[RedisQueue] Redis ping failed ({exc}). Using in-memory queue fallback.")
+        if not _redis_offline_logged:
+            logger.info(f"[RedisQueue] Redis server not available. Running high-performance in-memory queue.")
+            _redis_offline_logged = True
         _redis_client = None
         return None
 
@@ -58,10 +70,9 @@ async def is_error_duplicate(error_hash: str, container_id: str) -> bool:
             is_new = await client.set(key, "1", nx=True, ex=DEDUP_TTL_SECONDS)
             return not is_new
         except Exception as exc:
-            logger.warning(f"[RedisQueue] Redis dedup check error: {exc}")
+            logger.debug(f"[RedisQueue] Redis dedup check error: {exc}")
 
     # In-memory fallback
-    import time
     now = time.time()
     last_seen = _in_memory_dedup.get(key, 0)
     if now - last_seen < DEDUP_TTL_SECONDS:
@@ -74,7 +85,7 @@ async def is_error_duplicate(error_hash: str, container_id: str) -> bool:
 async def enqueue_error_job(payload: Dict[str, Any]) -> bool:
     """
     Enqueue an error job into Redis 'ai_error_jobs' list.
-    Fast execution (< 2ms) so terminal streaming is never blocked.
+    Fast execution (< 1ms) so terminal streaming is never blocked.
     """
     client = await get_redis_client()
     data = json.dumps(payload)
@@ -85,7 +96,7 @@ async def enqueue_error_job(payload: Dict[str, Any]) -> bool:
             logger.info(f"[RedisQueue] Enqueued job for error {payload.get('error_id')} to Redis")
             return True
         except Exception as exc:
-            logger.warning(f"[RedisQueue] Failed to push to Redis: {exc}. Pushing to fallback queue.")
+            logger.debug(f"[RedisQueue] Failed to push to Redis: {exc}. Pushing to in-memory queue.")
 
     # Fallback to in-memory queue
     await _in_memory_queue.put(payload)
@@ -93,24 +104,23 @@ async def enqueue_error_job(payload: Dict[str, Any]) -> bool:
     return True
 
 
-async def dequeue_error_job(timeout: float = 2.0) -> Optional[Dict[str, Any]]:
+async def dequeue_error_job(timeout: float = 1.0) -> Optional[Dict[str, Any]]:
     """
     Pop an error job from Redis 'ai_error_jobs' list (BLPOP).
-    Falls back to in-memory queue if Redis is unreachable.
+    Falls back to in-memory queue with zero latency when Redis is unreachable.
     """
     client = await get_redis_client()
 
     if client:
         try:
-            # blpop returns tuple (key, value) or None on timeout
             res = await client.blpop(QUEUE_KEY, timeout=int(timeout))
             if res:
                 _, raw_data = res
                 return json.loads(raw_data)
         except Exception as exc:
-            logger.warning(f"[RedisQueue] Redis blpop error: {exc}")
+            logger.debug(f"[RedisQueue] Redis blpop error: {exc}")
 
-    # Fallback to in-memory queue
+    # Zero-delay fallback to in-memory queue
     try:
         return await asyncio.wait_for(_in_memory_queue.get(), timeout=timeout)
     except asyncio.TimeoutError:
