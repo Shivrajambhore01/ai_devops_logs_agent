@@ -37,7 +37,11 @@ interface DockerErrorStore {
   addError: (entry: LiveDockerError) => void
 
   /** Attach the AI summary to an existing error entry by error_id. */
-  attachSummary: (error_id: string, summary: NonNullable<LiveDockerError['summary']>) => void
+  attachSummary: (
+    error_id: string,
+    summary: NonNullable<LiveDockerError['summary']>,
+    meta?: { container_id?: string; container_name?: string }
+  ) => void
 
   /** Load historical errors from the database (called on page mount). */
   loadHistory: (entries: LiveDockerError[]) => void
@@ -101,14 +105,19 @@ export const useDockerErrorStore = create<DockerErrorStore>((set) => ({
       }
     }),
 
-  attachSummary: (error_id, summary) =>
+  attachSummary: (error_id, summary, meta) =>
     set((state) => {
       // 1. Direct error_id match
       let matched = false
       let newErrors = state.errors.map((e) => {
         if (e.error_id === error_id) {
           matched = true
-          return { ...e, summary }
+          return {
+            ...e,
+            summary,
+            container_name: (meta?.container_name && meta.container_name !== 'container') ? meta.container_name : e.container_name,
+            container_id: (meta?.container_id && meta.container_id !== 'container') ? meta.container_id : e.container_id,
+          }
         }
         return e
       })
@@ -122,6 +131,8 @@ export const useDockerErrorStore = create<DockerErrorStore>((set) => ({
             ...newErrors[unsummarizedIdx],
             error_id,
             summary,
+            container_name: (meta?.container_name && meta.container_name !== 'container') ? meta.container_name : newErrors[unsummarizedIdx].container_name,
+            container_id: (meta?.container_id && meta.container_id !== 'container') ? meta.container_id : newErrors[unsummarizedIdx].container_id,
           }
           matched = true
         }
@@ -131,8 +142,8 @@ export const useDockerErrorStore = create<DockerErrorStore>((set) => ({
       if (!matched) {
         const fallbackEntry: LiveDockerError = {
           error_id,
-          container_id: 'container',
-          container_name: 'container',
+          container_id: meta?.container_id || 'container',
+          container_name: meta?.container_name || 'container',
           raw_message: summary.title,
           timestamp: new Date().toISOString(),
           occurrences: 1,

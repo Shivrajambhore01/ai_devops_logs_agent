@@ -13,6 +13,9 @@ import asyncio
 import logging
 import os
 import shlex
+import shutil
+import subprocess
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,19 +34,32 @@ ALLOWED_COMMANDS = [
     "npm start",
     "npm test",
     "npm run build",
+    "npm run lint",
+    "npm",
+    "npx",
     "yarn dev",
     "yarn start",
+    "yarn",
+    "pnpm dev",
+    "pnpm start",
+    "pnpm",
     "python app.py",
     "python main.py",
     "python -m pytest",
     "python -m uvicorn",
+    "python",
     "uvicorn app.main:app",
     "uvicorn app.main:app --reload",
+    "uvicorn",
     "flask run",
+    "flask",
     "node server.js",
     "node index.js",
+    "node",
     "go run main.go",
     "cargo run",
+    "git status",
+    "git log",
     "make dev",
     "make start",
 ]
@@ -67,7 +83,7 @@ class TerminalSession:
         self.working_dir   = working_dir
         self.user_id       = user_id
         self.status        = "STARTING"
-        self.process: Optional[asyncio.subprocess.Process] = None
+        self.process: Optional[subprocess.Popen] = None
         self.created_at    = datetime.now(timezone.utc).isoformat()
         self.exit_code: Optional[int] = None
         self._detector     = ErrorDetector(session_id, self._on_error)
@@ -90,6 +106,12 @@ class TerminalSession:
         from app.ai.error_analyzer import analyze_error_async
         asyncio.create_task(analyze_error_async(normalized_error, self.session_id))
 
+    async def _handle_line(self, line: str) -> None:
+        """Process a single stdout/stderr line through error detection and broadcast."""
+        level = await self._detector.feed_line(line)
+        event_type = EventType.STACKTRACE if level == LogLevel.ERROR else EventType.OUTPUT
+        await self._broadcast(line, level, event_type)
+
     async def start(self) -> None:
         if not _command_allowed(self.command):
             raise PermissionError(f"Command not in whitelist: '{self.command}'")
@@ -99,53 +121,63 @@ class TerminalSession:
             raise FileNotFoundError(f"Working directory does not exist: {self.working_dir}")
 
         parts = shlex.split(self.command)
-        env = {**os.environ, "FORCE_COLOR": "0", "NO_COLOR": "1"}
+        env = {
+            **os.environ,
+            "FORCE_COLOR": "0",
+            "NO_COLOR": "1",
+            "PYTHONUNBUFFERED": "1",
+        }
 
-        self.process = await asyncio.create_subprocess_exec(
-            *parts,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        executable = shutil.which(parts[0]) or parts[0]
+        loop = asyncio.get_running_loop()
+
+        self.process = subprocess.Popen(
+            [executable, *parts[1:]],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             cwd=str(work_path),
             env=env,
+            text=True,
+            bufsize=1,
+            errors="replace",
         )
         self.status = "RUNNING"
         await self._broadcast(f"▶ Process started: {self.command} (PID {self.process.pid})", LogLevel.INFO, EventType.PROCESS_STARTED)
         logger.info(f"[LocalTerminal] Session {self.session_id} started PID {self.process.pid}")
 
-        # Stream stdout & stderr concurrently
-        asyncio.create_task(self._stream(self.process.stdout, "stdout"))
-        asyncio.create_task(self._stream(self.process.stderr, "stderr"))
-        asyncio.create_task(self._wait_exit())
+        def _reader(stream, stream_name: str):
+            try:
+                for line in iter(stream.readline, ""):
+                    clean = line.rstrip("\r\n")
+                    if not clean:
+                        continue
+                    asyncio.run_coroutine_threadsafe(self._handle_line(clean), loop)
+            except Exception as exc:
+                logger.warning(f"[LocalTerminal] Stream {stream_name} error: {exc}")
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
-    async def _stream(self, stream, stream_name: str) -> None:
-        if stream is None:
-            return
-        try:
-            async for raw_bytes in stream:
-                line = raw_bytes.decode("utf-8", errors="replace").rstrip()
-                if not line:
-                    continue
-                level = await self._detector.feed_line(line)
-                event_type = EventType.STACKTRACE if level == LogLevel.ERROR else EventType.OUTPUT
-                await self._broadcast(line, level, event_type)
-        except Exception as exc:
-            logger.warning(f"[LocalTerminal] Stream error on {stream_name}: {exc}")
-
-    async def _wait_exit(self) -> None:
-        if self.process:
-            await self.process.wait()
+        def _waiter():
+            self.process.wait()
             self.exit_code = self.process.returncode
             self.status = "EXITED"
             level = LogLevel.ERROR if self.exit_code != 0 else LogLevel.INFO
             msg = f"■ Process exited with code {self.exit_code}"
-            await self._broadcast(msg, level, EventType.PROCESS_EXITED)
+            asyncio.run_coroutine_threadsafe(self._broadcast(msg, level, EventType.PROCESS_EXITED), loop)
+
+        threading.Thread(target=_reader, args=(self.process.stdout, "stdout"), daemon=True).start()
+        threading.Thread(target=_reader, args=(self.process.stderr, "stderr"), daemon=True).start()
+        threading.Thread(target=_waiter, daemon=True).start()
 
     async def stop(self) -> None:
-        if self.process and self.process.returncode is None:
+        if self.process and self.process.poll() is None:
             self.process.terminate()
             try:
-                await asyncio.wait_for(self.process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
+                await asyncio.to_thread(self.process.wait, 5.0)
+            except Exception:
                 self.process.kill()
         self.status = "STOPPED"
 
@@ -167,7 +199,13 @@ class LocalTerminalManager:
     async def start_session(self, session_id: str) -> None:
         session = self._sessions.get(session_id)
         if session:
-            await session.start()
+            try:
+                await session.start()
+            except Exception as exc:
+                err_msg = str(exc) or type(exc).__name__
+                logger.error(f"[LocalTerminal] Failed to start session {session_id}: {err_msg}", exc_info=True)
+                session.status = "ERROR"
+                await session._broadcast(f"✖ Failed to start process: {err_msg}", LogLevel.ERROR, EventType.PROCESS_EXITED)
 
     async def stop_session(self, session_id: str) -> None:
         session = self._sessions.get(session_id)

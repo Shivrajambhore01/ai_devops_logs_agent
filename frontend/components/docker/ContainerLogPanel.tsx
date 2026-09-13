@@ -59,9 +59,9 @@ export function ContainerLogPanel({ container }: ContainerLogPanelProps) {
   }, [container.id, container.name, addError])
 
   const onAISummary = useCallback((summary: DockerAIEvent) => {
-    // Inject AI summary line into console
+    // Inject AI summary line into console with unique timestamped id
     const aiLine: DockerLogLine = {
-      id:         'ai_' + summary.error_id,
+      id:         `ai_${summary.error_id}_${Date.now()}`,
       session_id: container.sessionId,
       timestamp:  summary.timestamp,
       level:      'AI',
@@ -70,17 +70,24 @@ export function ContainerLogPanel({ container }: ContainerLogPanelProps) {
     }
     setLines((prev) => [...prev, aiLine].slice(-2000))
 
-    // Attach summary to the error entry in global store
-    attachSummary(summary.error_id, {
-      title:              summary.title,
-      what_happened:      summary.what_happened,
-      why_it_happened:    summary.why_it_happened,
-      recommended_fix:    summary.recommended_fix,
-      severity:           summary.severity,
-      confidence:         summary.confidence,
-      suggested_commands: summary.suggested_commands,
-    })
-  }, [container.sessionId, attachSummary])
+    // Attach summary to the error entry in global store with container metadata
+    attachSummary(
+      summary.error_id,
+      {
+        title:              summary.title,
+        what_happened:      summary.what_happened,
+        why_it_happened:    summary.why_it_happened,
+        recommended_fix:    summary.recommended_fix,
+        severity:           summary.severity,
+        confidence:         summary.confidence,
+        suggested_commands: summary.suggested_commands,
+      },
+      {
+        container_id:   container.id,
+        container_name: container.name,
+      }
+    )
+  }, [container.id, container.name, container.sessionId, attachSummary])
 
   useDockerStream({
     sessionId:      container.sessionId,
@@ -112,21 +119,21 @@ export function ContainerLogPanel({ container }: ContainerLogPanelProps) {
   const errorCount = lines.filter((l) => l.level === 'ERROR').length
 
   return (
-    <div className="rounded-xl border border-[#2a2a3e] overflow-hidden flex flex-col bg-[#080810]" style={{ height: 280 }}>
+    <div className="rounded-xl border border-border overflow-hidden flex flex-col bg-card shadow-xs" style={{ height: 280 }}>
       {/* ── Header ─────────────────────────────────────────── */}
-      <div className="flex items-center justify-between px-4 py-2 bg-[#0e0e1a] border-b border-[#2a2a3e] shrink-0">
+      <div className="flex items-center justify-between px-4 py-2 bg-muted/50 border-b border-border shrink-0">
         <div className="flex items-center gap-3">
           {/* macOS dots */}
           <div className="flex gap-1.5">
-            <div className="w-2.5 h-2.5 rounded-full bg-[#e06c75]" />
-            <div className="w-2.5 h-2.5 rounded-full bg-[#e5c07b]" />
-            <div className="w-2.5 h-2.5 rounded-full bg-[#98c379]" />
+            <div className="w-2.5 h-2.5 rounded-full bg-red-500" />
+            <div className="w-2.5 h-2.5 rounded-full bg-amber-500" />
+            <div className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-xs font-semibold text-white font-mono">{container.name}</span>
-            <span className="text-[10px] text-[#5c6370]">{container.image}</span>
+            <span className="text-xs font-semibold text-foreground font-mono">{container.name}</span>
+            <span className="text-[10px] text-muted-foreground">{container.image}</span>
             {container.ports && container.ports !== 'N/A' && (
-              <span className="text-[10px] font-mono text-[#61afef]">:{container.ports}</span>
+              <span className="text-[10px] font-mono text-primary">:{container.ports}</span>
             )}
           </div>
         </div>
@@ -134,7 +141,7 @@ export function ContainerLogPanel({ container }: ContainerLogPanelProps) {
         <div className="flex items-center gap-2">
           {/* Error count badge */}
           {errorCount > 0 && (
-            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-[#e06c75]/20 text-[#e06c75]">
+            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-red-500/20 text-red-500">
               {errorCount} err
             </span>
           )}
@@ -144,7 +151,7 @@ export function ContainerLogPanel({ container }: ContainerLogPanelProps) {
               key={lvl}
               onClick={() => setLevelFilter(levelFilter === lvl ? null : lvl)}
               className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-bold transition-all ${
-                levelFilter === lvl ? LEVEL_BG[lvl] : 'text-[#5c6370] hover:text-[#abb2bf]'
+                levelFilter === lvl ? LEVEL_BG[lvl] : 'text-muted-foreground hover:text-foreground'
               }`}
             >
               {lvl}
@@ -163,7 +170,7 @@ export function ContainerLogPanel({ container }: ContainerLogPanelProps) {
           {/* Clear */}
           <button
             onClick={() => setLines([])}
-            className="text-[9px] font-mono text-[#5c6370] hover:text-[#e06c75] transition-colors"
+            className="text-[9px] font-mono text-muted-foreground hover:text-red-500 transition-colors"
           >
             CLR
           </button>
@@ -174,31 +181,31 @@ export function ContainerLogPanel({ container }: ContainerLogPanelProps) {
       <div
         ref={containerRef}
         onScroll={handleScroll}
-        className="flex-1 overflow-y-auto font-mono text-[11px] leading-5 bg-[#080810] p-2 space-y-px"
-        style={{ scrollbarWidth: 'thin', scrollbarColor: '#2a2a3e transparent' }}
+        className="flex-1 overflow-y-auto font-mono text-[11px] leading-5 bg-[#090d16] p-2 space-y-px"
+        style={{ scrollbarWidth: 'thin' }}
       >
         {filtered.length === 0 && (
-          <div className="text-[#3d3d52] text-center mt-6 text-xs">
+          <div className="text-muted-foreground text-center mt-6 text-xs">
             {wsStatus === 'CONNECTING' || wsStatus === 'CONNECTED'
               ? 'Waiting for container logs…'
               : 'No output captured.'}
           </div>
         )}
-        {filtered.map((line) => (
-          <LogLine key={line.id} line={line} />
+        {filtered.map((line, idx) => (
+          <LogLine key={`${line.id}-${idx}`} line={line} />
         ))}
         <div ref={bottomRef} />
       </div>
 
       {/* ── Footer ─────────────────────────────────────────── */}
-      <div className="flex items-center justify-between px-3 py-1 bg-[#0e0e1a] border-t border-[#2a2a3e] shrink-0">
-        <span className="text-[9px] font-mono text-[#3d3d52]">
+      <div className="flex items-center justify-between px-3 py-1.5 bg-muted/50 border-t border-border shrink-0">
+        <span className="text-[9px] font-mono text-muted-foreground">
           {filtered.length} lines · {container.sessionId}
         </span>
         {!autoScroll && (
           <button
             onClick={() => { setAutoScroll(true); bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }}
-            className="text-[9px] font-mono text-[#61afef] hover:text-white transition-colors animate-bounce"
+            className="text-[9px] font-mono text-primary hover:underline transition-colors animate-bounce"
           >
             ↓ scroll to bottom
           </button>

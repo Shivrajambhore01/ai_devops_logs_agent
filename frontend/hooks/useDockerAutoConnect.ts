@@ -47,14 +47,18 @@ export function useDockerAutoConnect() {
         setContainers(connected)
         setIsConnecting(false) // Render containers instantly!
 
-        // Load error history asynchronously in background
-        fetchDockerErrors({ limit: 100 })
+        // Load error history asynchronously in background (last 1 hour only)
+        fetchDockerErrors({ limit: 100, hours: 1 })
           .then((history) => {
             if (!mounted) return
             const entries: LiveDockerError[] = history.map((h) => ({
               error_id:       h.error.id,
               container_id:   h.error.container_id,
               container_name: h.error.container_name,
+              error_type:     h.error.error_type || undefined,
+              file_path:      h.error.file_path || undefined,
+              line_number:    h.error.line_number || undefined,
+              raw_stack_trace: h.error.raw_stack_trace || undefined,
               raw_message:    h.error.error_message,
               timestamp:      h.error.created_at,
               summary:        h.summary

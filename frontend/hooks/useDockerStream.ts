@@ -1,6 +1,6 @@
 /**
- * WebSocket hook for a single Docker container stream session.
- * Handles connection lifecycle, heartbeat, auto-reconnect.
+ * WebSocket hook for Docker container stream sessions.
+ * Handles connection lifecycle, heartbeat, auto-reconnect, and sequence resume.
  * Emits: onLine (log line), onErrorDetected (structured error), onAISummary (AI analysis complete)
  */
 'use client'
@@ -10,6 +10,7 @@ import { buildStreamWsUrl } from '@/lib/docker-api'
 export interface DockerLogLine {
   id: string
   session_id: string
+  seq?: number
   timestamp: string
   container?: string
   level: 'INFO' | 'WARN' | 'ERROR' | 'AI' | 'DEBUG'
@@ -46,7 +47,7 @@ export interface DockerAIEvent {
 }
 
 interface UseDockerStreamOptions {
-  sessionId: string
+  sessionId?: string
   onLine: (line: DockerLogLine) => void
   onErrorDetected?: (error: DockerErrorEvent) => void
   onAISummary: (summary: DockerAIEvent) => void
@@ -63,6 +64,7 @@ export function useDockerStream({
   const wsRef = useRef<WebSocket | null>(null)
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const reconnectAttemptsRef = useRef(0)
+  const lastSeqRef = useRef<number | null>(null)
   const MAX_RECONNECTS = 5
   const closedRef = useRef(false)
 
@@ -75,7 +77,7 @@ export function useDockerStream({
 
   const connect = useCallback(() => {
     if (closedRef.current) return
-    const url = buildStreamWsUrl(sessionId)
+    const url = buildStreamWsUrl(sessionId, lastSeqRef.current)
     const ws = new WebSocket(url)
     wsRef.current = ws
 
@@ -91,6 +93,10 @@ export function useDockerStream({
     ws.onmessage = (ev: MessageEvent) => {
       try {
         const data = JSON.parse(ev.data as string)
+        if (typeof data.seq === 'number') {
+          lastSeqRef.current = data.seq
+        }
+
         if (data.event_type === 'AI_ANALYSIS_COMPLETED' && data.ai_summary) {
           onAISummary(data.ai_summary as DockerAIEvent)
         } else if (data.event_type === 'ERROR_DETECTED' && data.error) {
@@ -99,7 +105,7 @@ export function useDockerStream({
           onLine(data as DockerLogLine)
         }
       } catch {
-        // Non-JSON messages (raw ping response) — ignore
+        // Non-JSON ping messages
       }
     }
 
@@ -109,7 +115,7 @@ export function useDockerStream({
       stopHeartbeat()
       if (!closedRef.current && reconnectAttemptsRef.current < MAX_RECONNECTS) {
         reconnectAttemptsRef.current++
-        const delay = 2000 * reconnectAttemptsRef.current
+        const delay = 1500 * reconnectAttemptsRef.current
         onStatusChange?.(`RECONNECTING (${reconnectAttemptsRef.current}/${MAX_RECONNECTS})`)
         setTimeout(connect, delay)
       } else {

@@ -18,9 +18,4 @@ class User(Base):
     reset_token_expires: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-    approvals = relationship("Approval", back_populates="user")
-    repositories = relationship("Repository", back_populates="user")
-    incidents = relationship("Incident", back_populates="user")
-    audit_logs = relationship("AuditLog", back_populates="user")
-
 

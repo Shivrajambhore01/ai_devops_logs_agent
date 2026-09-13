@@ -67,15 +67,15 @@ export function TerminalConsole({ sessionId, title, source, onAIError, height = 
   }, [sessionId, onLine, onAISummary])
 
   useEffect(() => {
-    if (autoScroll) {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" })
+    if (autoScroll && containerRef.current) {
+      containerRef.current.scrollTop = containerRef.current.scrollHeight
     }
   }, [lines, autoScroll])
 
   const handleScroll = () => {
     const el = containerRef.current
     if (!el) return
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 35
     setAutoScroll(atBottom)
   }
 
@@ -87,24 +87,24 @@ export function TerminalConsole({ sessionId, title, source, onAIError, height = 
     : "#56b6c2"
 
   return (
-    <div className="rounded-xl border border-[#2a2a3e] overflow-hidden flex flex-col" style={{ height }}>
+    <div className="rounded-xl border border-border overflow-hidden flex flex-col min-w-0 w-full bg-card shadow-xs" style={{ height }}>
       {/* Header bar */}
-      <div className="flex items-center justify-between px-4 py-2.5 bg-[#0e0e1a] border-b border-[#2a2a3e]">
-        <div className="flex items-center gap-3">
-          <div className="flex gap-1.5">
-            <div className="w-3 h-3 rounded-full bg-[#e06c75]" />
-            <div className="w-3 h-3 rounded-full bg-[#e5c07b]" />
-            <div className="w-3 h-3 rounded-full bg-[#98c379]" />
+      <div className="flex items-center justify-between px-4 py-2.5 bg-muted/60 border-b border-border min-w-0">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="flex gap-1.5 shrink-0">
+            <div className="w-3 h-3 rounded-full bg-red-500" />
+            <div className="w-3 h-3 rounded-full bg-amber-500" />
+            <div className="w-3 h-3 rounded-full bg-emerald-500" />
           </div>
-          <span className="text-xs font-mono text-[#abb2bf]">{title || sessionId}</span>
+          <span className="text-xs font-mono text-foreground font-semibold truncate">{title || sessionId}</span>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2.5 shrink-0">
           {/* Filter buttons */}
           {(["ERROR", "WARN", "AI"] as const).map(lvl => (
             <button
               key={lvl}
               onClick={() => setFilter(filter === lvl ? null : lvl)}
-              className={`text-[10px] px-2 py-0.5 rounded font-mono transition-all ${filter === lvl ? LEVEL_BADGES[lvl] : "text-[#5c6370] hover:text-[#abb2bf]"}`}
+              className={`text-[10px] px-2 py-0.5 rounded font-mono transition-all ${filter === lvl ? LEVEL_BADGES[lvl] : "text-muted-foreground hover:text-foreground"}`}
             >
               {lvl}
             </button>
@@ -115,7 +115,7 @@ export function TerminalConsole({ sessionId, title, source, onAIError, height = 
           </div>
           <button
             onClick={() => setLines([])}
-            className="text-[10px] font-mono text-[#5c6370] hover:text-[#e06c75] transition-colors"
+            className="text-[10px] font-mono text-muted-foreground hover:text-red-500 transition-colors"
           >
             CLEAR
           </button>
@@ -126,11 +126,11 @@ export function TerminalConsole({ sessionId, title, source, onAIError, height = 
       <div
         ref={containerRef}
         onScroll={handleScroll}
-        className="flex-1 overflow-y-auto font-mono text-[12px] leading-6 bg-[#080810] p-3 space-y-px"
-        style={{ scrollbarWidth: "thin", scrollbarColor: "#2a2a3e transparent" }}
+        className="flex-1 overflow-y-auto overflow-x-hidden font-mono text-[12px] leading-6 bg-[#0a0f1d] p-3.5 space-y-px min-w-0"
+        style={{ scrollbarWidth: "thin" }}
       >
         {filteredLines.length === 0 && (
-          <div className="text-[#3d3d52] text-center mt-8">
+          <div className="text-muted-foreground text-center mt-8 text-xs">
             {wsStatus === "CONNECTING" || wsStatus === "CONNECTED"
               ? "Waiting for terminal output..."
               : "No output captured."}
@@ -139,20 +139,24 @@ export function TerminalConsole({ sessionId, title, source, onAIError, height = 
         {filteredLines.map(line => (
           <TerminalLineRow key={line.id} line={line} />
         ))}
-        <div ref={bottomRef} />
       </div>
 
       {/* Footer */}
-      <div className="flex items-center justify-between px-4 py-1.5 bg-[#0e0e1a] border-t border-[#2a2a3e]">
-        <span className="text-[10px] font-mono text-[#3d3d52]">
+      <div className="flex items-center justify-between px-4 py-2 bg-muted/60 border-t border-border min-w-0">
+        <span className="text-[10px] font-mono text-muted-foreground">
           {filteredLines.length} lines · session:{sessionId.slice(0, 12)}
         </span>
         {!autoScroll && (
           <button
-            onClick={() => { setAutoScroll(true); bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }}
-            className="text-[10px] font-mono text-[#61afef] hover:text-white transition-colors animate-bounce"
+            onClick={() => {
+              setAutoScroll(true)
+              if (containerRef.current) {
+                containerRef.current.scrollTop = containerRef.current.scrollHeight
+              }
+            }}
+            className="text-[10px] font-mono text-primary hover:underline transition-colors animate-pulse font-medium"
           >
-            ↓ scroll to bottom
+            ↓ Auto-scroll paused (click to resume)
           </button>
         )}
       </div>
@@ -165,7 +169,7 @@ function TerminalLineRow({ line }: { line: TerminalLine }) {
   const ts = new Date(line.timestamp).toLocaleTimeString("en-US", { hour12: false })
 
   return (
-    <div className="flex items-start gap-2 hover:bg-[#12122a] px-1 rounded-sm transition-colors group">
+    <div className="flex items-start gap-2 hover:bg-[#12122a] px-1 rounded-sm transition-colors group min-w-0">
       <span className="text-[#3d3d52] shrink-0 select-none text-[10px] mt-px">{ts}</span>
       <span
         className="shrink-0 text-[10px] font-bold w-8 mt-px opacity-0 group-hover:opacity-100 transition-opacity"
@@ -173,7 +177,7 @@ function TerminalLineRow({ line }: { line: TerminalLine }) {
       >
         {line.level.slice(0, 4)}
       </span>
-      <span className="break-all whitespace-pre-wrap flex-1" style={{ color }}>
+      <span className="break-all whitespace-pre-wrap flex-1 min-w-0 overflow-hidden leading-snug" style={{ color }}>
         {line.message}
       </span>
     </div>

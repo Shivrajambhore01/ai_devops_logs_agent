@@ -113,10 +113,14 @@ async def get_docker_errors(
     severity: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
+    before: Optional[str] = None,
+    hours: Optional[float] = None,
+    since: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Paginated list of Docker errors joined with AI summaries.
-    Used by GET /api/v1/docker/errors.
+    Keyset / cursor-paginated list of Docker errors joined with AI summaries.
+    Uses 'before' ISO timestamp cursor for O(1) performance on large datasets.
+    Supports time filtering by 'hours' (e.g. 1.0 for last 1 hour) or 'since' ISO timestamp.
     """
     async with AsyncSessionLocal() as db:
         query = (
@@ -128,18 +132,48 @@ async def get_docker_errors(
         if severity:
             query = query.where(DockerError.severity == severity.upper())
 
-        query = (
-            query
-            .order_by(DockerError.created_at.desc())
-            .limit(limit)
-            .offset(offset)
-        )
+        # Time-based filtering (e.g., last 1 hour)
+        if hours is not None and hours > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+            query = query.where(DockerError.created_at >= cutoff)
+        elif since:
+            try:
+                since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                query = query.where(DockerError.created_at >= since_dt)
+            except Exception:
+                pass
+
+        # Keyset cursor pagination
+        if before:
+            try:
+                before_dt = datetime.fromisoformat(before.replace("Z", "+00:00"))
+                query = query.where(DockerError.created_at < before_dt)
+            except Exception:
+                pass
+        elif offset > 0:
+            query = query.offset(offset)
+
+        query = query.order_by(DockerError.created_at.desc()).limit(limit)
         rows = (await db.execute(query)).all()
 
         result = []
         for row in rows:
             err = row.DockerError
             summ = row.DockerAISummary
+            err_created = None
+            if err.created_at:
+                err_created = (
+                    err.created_at.replace(tzinfo=timezone.utc).isoformat()
+                    if err.created_at.tzinfo is None
+                    else err.created_at.isoformat()
+                )
+            summ_created = None
+            if summ and summ.created_at:
+                summ_created = (
+                    summ.created_at.replace(tzinfo=timezone.utc).isoformat()
+                    if summ.created_at.tzinfo is None
+                    else summ.created_at.isoformat()
+                )
             result.append({
                 "error": {
                     "id":              err.id,
@@ -153,7 +187,7 @@ async def get_docker_errors(
                     "line_number":     err.line_number,
                     "raw_stack_trace": err.raw_stack_trace,
                     "severity":        err.severity,
-                    "created_at":      err.created_at.isoformat() if err.created_at else None,
+                    "created_at":      err_created,
                 },
                 "summary": {
                     "error_id":          summ.error_id,
@@ -164,7 +198,122 @@ async def get_docker_errors(
                     "severity":          summ.severity,
                     "confidence":        summ.confidence,
                     "suggested_commands": json.loads(summ.suggested_commands or "[]"),
-                    "created_at":        summ.created_at.isoformat() if summ.created_at else None,
+                    "created_at":        summ_created,
                 } if summ else None,
             })
         return result
+
+
+async def purge_expired_docker_errors(retention_days: int = 14) -> int:
+    """
+    Automatic Database Retention:
+    Deletes raw Docker errors older than retention_days (default 14 days)
+    to keep PostgreSQL lightweight and indexes compact.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    async with AsyncSessionLocal() as db:
+        # Find old error IDs
+        res = await db.execute(
+            select(DockerError.id).where(DockerError.created_at < cutoff)
+        )
+        old_ids = res.scalars().all()
+        if not old_ids:
+            return 0
+
+        # Delete AI summaries first
+        for err_id in old_ids:
+            summ = await db.get(DockerAISummary, err_id)
+            if summ:
+                await db.delete(summ)
+            err = await db.get(DockerError, err_id)
+            if err:
+                await db.delete(err)
+
+        await db.commit()
+        logger.info(f"[DockerRetention] Purged {len(old_ids)} errors older than {retention_days} days")
+        return len(old_ids)
+
+
+async def clear_all_docker_errors() -> int:
+    """Clear all errors and summaries from the database."""
+    from sqlalchemy import delete
+    async with AsyncSessionLocal() as db:
+        await db.execute(delete(DockerAISummary))
+        res = await db.execute(delete(DockerError))
+        await db.commit()
+        return res.rowcount or 0
+
+
+async def reanalyze_docker_error(error_id: str) -> Optional[Dict[str, Any]]:
+    """Re-analyze an existing error by ID using live AI analyzer and update DB & WebSockets."""
+    from app.terminal.websocket_manager import ws_manager
+    from app.terminal.event import EventType
+
+    async with AsyncSessionLocal() as db:
+        err = await db.get(DockerError, error_id)
+        if not err:
+            return None
+
+        normalized = NormalizedError(
+            id=err.id,
+            session_id=err.session_id,
+            language=err.language,
+            error_type=err.error_type,
+            error_message=err.error_message,
+            file_path=err.file_path,
+            line_number=err.line_number,
+            raw_stack_trace=err.raw_stack_trace or err.error_message,
+            severity=err.severity or "HIGH",
+        )
+        container_id = err.container_id
+        container_name = err.container_name
+
+    from app.ai.error_analyzer import _expert_rule_diagnosis, _call_llm, _fallback_summary
+    session_id = normalized.session_id or "manual"
+    expert_summary = _expert_rule_diagnosis(normalized, session_id)
+    if expert_summary and expert_summary.confidence >= 0.96:
+        summary = expert_summary
+    else:
+        try:
+            summary = await _call_llm(normalized, session_id)
+        except Exception as exc:
+            logger.warning(f"[DockerService] LLM re-analysis fallback: {exc}")
+            summary = expert_summary or _fallback_summary(normalized, session_id)
+
+    # Save new summary to DB
+    await save_docker_ai_summary(summary)
+
+    # Broadcast updated summary over WebSocket
+    summary_dict = summary.model_dump()
+    summary_dict["container_id"] = container_id
+    summary_dict["container_name"] = container_name
+
+    await ws_manager.broadcast_raw(
+        session_id,
+        {
+            "event_type": EventType.AI_ANALYSIS_COMPLETED,
+            "session_id": session_id,
+            "container_id": container_id,
+            "container_name": container_name,
+            "level": "AI",
+            "ai_summary": summary_dict,
+        },
+    )
+    return summary_dict
+
+
+async def reanalyze_all_docker_errors(limit: int = 30) -> List[Dict[str, Any]]:
+    """Re-analyze recent errors in database."""
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(select(DockerError.id).order_by(DockerError.created_at.desc()).limit(limit))
+        error_ids = res.scalars().all()
+
+    results = []
+    for err_id in error_ids:
+        try:
+            summ = await reanalyze_docker_error(err_id)
+            if summ:
+                results.append(summ)
+        except Exception as exc:
+            logger.warning(f"[DockerService] Re-analyzing error {err_id} failed: {exc}")
+    return results

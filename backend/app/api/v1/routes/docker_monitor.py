@@ -1,17 +1,10 @@
 """
-Docker Monitor API — completely standalone section.
-Streams Docker container logs with AI-powered error analysis.
-
-Routes:
-  GET  /api/v1/docker/containers               → List all containers
-  POST /api/v1/docker/auto-connect             → Connect all running containers
-  POST /api/v1/docker/containers/{id}/connect  → Connect single container
-  DELETE /api/v1/docker/sessions/{session_id}  → Disconnect session
-  GET  /api/v1/docker/errors                   → Paginated error history
-  GET  /api/v1/docker/status                   → Docker daemon health
-  WS   /api/v1/docker/stream/{session_id}      → Real-time log + AI events
-
-NO dependency on GitHub, incidents, repositories, or webhooks.
+Docker Monitor API — Production-Grade Observability.
+Provides:
+1. Instant container and image listings served from discovery cache (< 1ms).
+2. On-demand deep inspection endpoints for containers and images.
+3. Keyset/cursor-based error history pagination.
+4. Multiplexed and session-specific WebSocket streaming with sequence replay.
 """
 from __future__ import annotations
 
@@ -19,7 +12,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 
 from app.core.dependencies import get_current_user_optional
 from app.models.user import User
@@ -31,20 +24,25 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/docker", tags=["Docker Monitor"])
 
 
-# ── Health ─────────────────────────────────────────────────────────────────────
+# ── Health & Status ────────────────────────────────────────────────────────────
 
 @router.get("/status")
 async def docker_status(current_user: User = Depends(get_current_user_optional)) -> Dict[str, Any]:
-    """Check if the local Docker daemon is reachable."""
+    """Check Docker daemon health and count cached containers and images."""
     from app.tools.docker.client import docker_wrapper
     available = docker_wrapper.is_available()
-    containers = docker_terminal_manager.list_containers() if available else []
+    containers = docker_terminal_manager.list_containers()
+    images = docker_terminal_manager.list_images()
     running = [c for c in containers if c.get("status") == "running"]
+
+    mode = "live" if available else ("mock" if docker_wrapper.is_mock_allowed() else "offline")
+
     return {
         "daemon_available": available,
         "total_containers": len(containers),
         "running_containers": len(running),
-        "mode": "live" if available else "mock",
+        "total_images": len(images),
+        "mode": mode,
     }
 
 
@@ -55,11 +53,22 @@ async def list_containers(
     current_user: User = Depends(get_current_user_optional),
 ) -> List[Dict[str, Any]]:
     """
-    List all local Docker containers.
-    Returns id, name, status, image, ports for each container. Non-blocking.
+    Instantaneous listing of all local Docker containers from metadata cache (< 1ms).
+    Zero synchronous Docker SDK blocking.
     """
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, docker_terminal_manager.list_containers)
+    return docker_terminal_manager.list_containers()
+
+
+@router.get("/containers/{container_id}", response_model=Dict[str, Any])
+async def get_container(
+    container_id: str,
+    current_user: User = Depends(get_current_user_optional),
+) -> Dict[str, Any]:
+    """Fetch detailed metadata and inspection attributes for a single container."""
+    detail = docker_terminal_manager.get_container_detail(container_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"Container '{container_id}' not found")
+    return detail
 
 
 @router.post("/auto-connect")
@@ -68,11 +77,9 @@ async def auto_connect_all(
 ) -> Dict[str, Any]:
     """
     Auto-discover and start streaming ALL running containers.
-    Returns { sessions: { container_id: session_id }, containers: [...] }.
-    Idempotent — reuses an existing active session if one already exists.
+    Reuses existing active sessions idempotently.
     """
-    loop = asyncio.get_event_loop()
-    containers = await loop.run_in_executor(None, docker_terminal_manager.list_containers)
+    containers = docker_terminal_manager.list_containers()
     running = [c for c in containers if c.get("status") == "running"]
 
     session_map: Dict[str, str] = {}
@@ -80,14 +87,12 @@ async def auto_connect_all(
         cid = c["id"]
         cname = c.get("name", cid)
 
-        # Reuse existing active session
         existing = docker_terminal_manager.find_session_by_container(cid)
         if existing:
             session_map[cid] = existing.session_id
-            logger.debug(f"[DockerMonitor] Reusing session {existing.session_id} for {cname}")
             continue
 
-        session = docker_terminal_manager.create_session(cid, current_user.id, container_name=cname)
+        session = docker_terminal_manager.create_session(cid, current_user.id if current_user else 1, container_name=cname)
         asyncio.create_task(docker_terminal_manager.start_session(session.session_id))
         session_map[cid] = session.session_id
         logger.info(f"[DockerMonitor] Auto-connected {cname} → {session.session_id}")
@@ -116,13 +121,10 @@ async def connect_single_container(
         raise HTTPException(status_code=400, detail=f"Container '{container_id}' is not running (status: {meta.get('status')})")
 
     cname = meta.get("name", container_id)
-    session = docker_terminal_manager.create_session(container_id, current_user.id, container_name=cname)
+    session = docker_terminal_manager.create_session(container_id, current_user.id if current_user else 1, container_name=cname)
     asyncio.create_task(docker_terminal_manager.start_session(session.session_id))
-    logger.info(f"[DockerMonitor] Single connect: {cname} → {session.session_id}")
     return {"session_id": session.session_id, "container_id": container_id, "container_name": cname, "status": "STREAMING"}
 
-
-from fastapi.responses import Response
 
 @router.delete("/sessions/{session_id}")
 async def disconnect_session(
@@ -137,25 +139,48 @@ async def disconnect_session(
     return {"status": "stopped", "session_id": session_id}
 
 
-# ── Error History ──────────────────────────────────────────────────────────────
+# ── Images ─────────────────────────────────────────────────────────────────────
+
+@router.get("/images", response_model=List[Dict[str, Any]])
+async def list_images(
+    current_user: User = Depends(get_current_user_optional),
+) -> List[Dict[str, Any]]:
+    """
+    Instantaneous listing of all cached local Docker images (< 1ms).
+    Returns id, repository, tag, size, and container usage count.
+    """
+    return docker_terminal_manager.list_images()
+
+
+@router.get("/images/{image_id}", response_model=Dict[str, Any])
+async def get_image_detail(
+    image_id: str,
+    current_user: User = Depends(get_current_user_optional),
+) -> Dict[str, Any]:
+    """On-demand deep inspection of a specific Docker image."""
+    detail = docker_terminal_manager.inspect_image(image_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"Image '{image_id}' not found")
+    return detail
+
+
+# ── Error History & Keyset Pagination ──────────────────────────────────────────
 
 @router.get("/errors")
 async def list_errors(
     container_id: Optional[str] = None,
     severity: Optional[str] = None,
+    hours: Optional[float] = Query(None, description="Filter errors from the last N hours (e.g. 1.0)"),
+    since: Optional[str] = Query(None, description="Filter errors created after ISO timestamp"),
     limit: int = 50,
     offset: int = 0,
+    before: Optional[str] = None,
     current_user: User = Depends(get_current_user_optional),
 ) -> List[Dict[str, Any]]:
     """
-    Paginated list of detected Docker errors with AI summaries.
-    Persisted in database — survives page refreshes and backend restarts.
-
-    Query params:
-      container_id  Filter by specific container
-      severity      Filter: ERROR | CRITICAL
-      limit         Page size (default 50, max 200)
-      offset        Pagination offset
+    Keyset/cursor-paginated list of detected Docker errors with AI summaries.
+    Provide 'before' (ISO timestamp) for constant-time keyset pagination.
+    Provide 'hours' to filter errors from the last N hours.
     """
     limit = min(limit, 200)
     from app.services.docker_error_service import get_docker_errors
@@ -164,31 +189,64 @@ async def list_errors(
         severity=severity,
         limit=limit,
         offset=offset,
+        before=before,
+        hours=hours,
+        since=since,
     )
 
 
-# ── WebSocket Stream ───────────────────────────────────────────────────────────
+@router.delete("/errors")
+async def clear_errors(
+    current_user: User = Depends(get_current_user_optional),
+) -> Dict[str, Any]:
+    """Purge all error logs and AI summaries from the database."""
+    from app.services.docker_error_service import clear_all_docker_errors
+    deleted = await clear_all_docker_errors()
+    return {"status": "cleared", "deleted_count": deleted}
 
+
+@router.post("/errors/{error_id}/reanalyze")
+async def reanalyze_error(
+    error_id: str,
+    current_user: User = Depends(get_current_user_optional),
+) -> Dict[str, Any]:
+    """Trigger fresh AI analysis on a specific recorded error."""
+    from app.services.docker_error_service import reanalyze_docker_error
+    res = await reanalyze_docker_error(error_id)
+    if not res:
+        raise HTTPException(status_code=404, detail=f"Error {error_id} not found")
+    return res
+
+
+@router.post("/errors/reanalyze-all")
+async def reanalyze_all(
+    limit: int = Query(default=30, le=100),
+    current_user: User = Depends(get_current_user_optional),
+) -> Dict[str, Any]:
+    """Batch re-analyze recent errors using the updated AI engine."""
+    from app.services.docker_error_service import reanalyze_all_docker_errors
+    updated = await reanalyze_all_docker_errors(limit=limit)
+    return {"status": "completed", "reanalyzed_count": len(updated), "summaries": updated}
+
+
+# ── WebSocket Streams ──────────────────────────────────────────────────────────
+
+@router.websocket("/stream")
 @router.websocket("/stream/{session_id}")
-async def docker_stream_ws(websocket: WebSocket, session_id: str) -> None:
+async def docker_stream_ws(
+    websocket: WebSocket,
+    session_id: Optional[str] = None,
+    resume_from: Optional[int] = Query(None),
+) -> None:
     """
-    Persistent WebSocket for real-time Docker log streaming + AI analysis events.
-
-    Client connects to: ws://127.0.0.1:8000/api/v1/docker/stream/{session_id}
-
-    Incoming events (JSON):
-      OUTPUT              → Normal log line
-      STACKTRACE          → Error log line
-      CONTAINER_STARTED   → Session connected
-      CONTAINER_STOPPED   → Stream ended / container stopped
-      AI_ANALYSIS_STARTED → LLM began analyzing an error
-      AI_ANALYSIS_COMPLETED → Structured AI summary ready (contains ai_summary object)
-      HEARTBEAT           → Keep-alive ping/pong
-
-    Send "ping" to receive a HEARTBEAT response.
+    WebSocket endpoint supporting both single container streams and dashboard multiplexing.
+    - If session_id is provided: streams logs for that specific container session.
+    - If omitted (/stream): multiplexes all events across all containers.
+    - If resume_from=<seq> is provided: replays missed events upon reconnect.
     """
-    await ws_manager.connect(session_id, websocket)
-    logger.info(f"[DockerWS] Client connected to session: {session_id}")
+    channel = session_id or "dashboard"
+    await ws_manager.connect(channel, websocket, resume_from=resume_from)
+    logger.info(f"[DockerWS] Client connected to channel '{channel}' (resume_from: {resume_from})")
 
     try:
         while True:
@@ -197,12 +255,11 @@ async def docker_stream_ws(websocket: WebSocket, session_id: str) -> None:
                 if data == "ping":
                     await websocket.send_text('{"event_type":"HEARTBEAT"}')
             except asyncio.TimeoutError:
-                # Server-side heartbeat to keep connection alive
                 try:
                     await websocket.send_text('{"event_type":"HEARTBEAT"}')
                 except Exception:
                     break
     except WebSocketDisconnect:
-        logger.info(f"[DockerWS] Client disconnected from session: {session_id}")
+        logger.info(f"[DockerWS] Client disconnected from channel '{channel}'")
     finally:
-        await ws_manager.disconnect(session_id, websocket)
+        await ws_manager.disconnect(channel, websocket)

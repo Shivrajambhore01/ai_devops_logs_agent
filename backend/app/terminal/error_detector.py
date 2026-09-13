@@ -118,22 +118,33 @@ class ErrorDetector:
 
 # ── Normalization helpers ──────────────────────────────────────────────────────
 
-_PY_ERROR_RE   = re.compile(r'^([A-Za-z][A-Za-z0-9_.]*(?:Error|Exception|Warning)):\s*(.*)', re.M)
-_JS_ERROR_RE   = re.compile(r'^([A-Za-z][A-Za-z0-9]*(?:Error|Exception)):\s*(.*)', re.M)
-_FILE_LINE_RE  = re.compile(r'(?:File|file)\s+"?([^":\n]+)"?,?\s+line\s+(\d+)', re.M)
-_AT_LINE_RE    = re.compile(r'at\s+[^\(]*\(?([^:\)\s]+):(\d+)(?::\d+)?\)?', re.M)
+_PY_ERROR_RE         = re.compile(r'^([A-Za-z][A-Za-z0-9_.]*(?:Error|Exception|Warning)):\s*(.*)', re.M)
+_JS_ERROR_RE         = re.compile(r'^([A-Za-z][A-Za-z0-9]*(?:Error|Exception)):\s*(.*)', re.M)
+_INLINE_ERROR_RE     = re.compile(r'(?::\s*|\s+|^)([A-Za-z][A-Za-z0-9_.]*(?:Error|Exception|Warning|Fault|Panic)):\s*(.*)', re.M)
+_FILE_LINE_RE        = re.compile(r'(?:File|file)\s+"?([^":\n]+)"?,?\s+line\s+(\d+)', re.M)
+_AT_LINE_RE          = re.compile(r'at\s+[^\(]*\(?([^:\)\s]+):(\d+)(?::\d+)?\)?', re.M)
+_FILE_COLON_LINE_RE  = re.compile(r'([a-zA-Z0-9_\-\.\/\\~]+\.(?:py|js|ts|tsx|jsx|go|rs|java|rb|php)):(\d+)', re.M)
 
 
 def _detect_language(raw: str) -> Optional[str]:
-    if "Traceback (most recent call last)" in raw or ".py" in raw:
+    raw_lower = raw.lower()
+    if "traceback (most recent call last)" in raw_lower or ".py" in raw_lower or "forkpoolworker" in raw_lower or "celery" in raw_lower:
         return "python"
-    if "at Object.<anonymous>" in raw or "at Module." in raw or "npm ERR" in raw or ".js" in raw:
+    if "at object.<anonymous>" in raw_lower or "at module." in raw_lower or "npm err" in raw_lower or ".js" in raw_lower:
         return "javascript"
-    if "goroutine" in raw and "panic:" in raw:
+    if "goroutine" in raw_lower and "panic:" in raw_lower:
         return "go"
-    if "at " in raw and ".ts:" in raw:
+    if "at " in raw_lower and (".ts:" in raw_lower or ".tsx:" in raw_lower):
         return "typescript"
     return None
+
+
+def _clean_error_message(msg: str) -> str:
+    """Strip bracketed logging headers and timestamps from message strings."""
+    cleaned = re.sub(r'^\[\d{4}-\d{2}-\d{2}[^\]]+\]\s*', '', msg).strip()
+    cleaned = re.sub(r'^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}[^\s]*\s*', '', cleaned).strip()
+    cleaned = re.sub(r'^(?:ERROR|WARN|WARNING|CRITICAL|INFO|DEBUG):\s*', '', cleaned, flags=re.I).strip()
+    return cleaned or msg
 
 
 def _normalize_error(raw: str, session_id: str) -> NormalizedError:
@@ -143,17 +154,24 @@ def _normalize_error(raw: str, session_id: str) -> NormalizedError:
     file_path  = None
     line_num   = None
 
-    # In Python tracebacks, the actual error is on the last line matching Error: message
+    # 1. First look for standard start-of-line tracebacks
     for pattern in [_PY_ERROR_RE, _JS_ERROR_RE]:
         matches = pattern.findall(raw)
         if matches:
-            # Use the last error line as it's the actual unhandled exception
             error_type, error_msg = matches[-1]
             error_msg = error_msg.strip()
             break
 
-    # Extract the innermost stack frame (the last File / line match)
-    file_matches = _FILE_LINE_RE.findall(raw) or _AT_LINE_RE.findall(raw)
+    # 2. If no start-of-line match, look for inline error headers (e.g. Celery / Uvicorn logs)
+    if not error_type:
+        inline_matches = _INLINE_ERROR_RE.findall(raw)
+        if inline_matches:
+            # Prefer last error/warning match
+            error_type, error_msg = inline_matches[-1]
+            error_msg = error_msg.strip()
+
+    # 3. Extract file and line from File "...", line X or path.ext:line
+    file_matches = _FILE_LINE_RE.findall(raw) or _AT_LINE_RE.findall(raw) or _FILE_COLON_LINE_RE.findall(raw)
     if file_matches:
         file_path, l_str = file_matches[-1]
         try:
@@ -161,26 +179,39 @@ def _normalize_error(raw: str, session_id: str) -> NormalizedError:
         except ValueError:
             pass
 
+    # 4. Clean error message
+    if error_msg:
+        error_msg = _clean_error_message(error_msg)
+
+    # 5. Fallback if message is still empty
     if not error_msg:
-        # Fallback to first line with ERROR
         first_error_line = next(
             (l for l in raw.splitlines() if detect_level(l) == "ERROR"), raw.splitlines()[0]
         )
-        error_msg = first_error_line.strip()[:300]
-        if not error_type:
-            if "500" in error_msg:
-                error_type = "HTTP500InternalServerError"
-            elif "Connection refused" in error_msg or "ECONNREFUSED" in error_msg:
-                error_type = "ConnectionRefusedError"
-            elif "OOMKilled" in raw or "137" in raw:
-                error_type = "OutOfMemoryError"
-            else:
-                error_type = "RuntimeError"
+        error_msg = _clean_error_message(first_error_line.strip()[:300])
+
+    if not error_type:
+        if "500" in error_msg:
+            error_type = "HTTP500InternalServerError"
+        elif "Connection refused" in error_msg or "ECONNREFUSED" in error_msg:
+            error_type = "ConnectionRefusedError"
+        elif "sawarning" in raw.lower():
+            error_type = "SAWarning"
+        elif "OOMKilled" in raw or "137" in raw:
+            error_type = "OutOfMemoryError"
+        elif "keyerror" in raw.lower():
+            error_type = "KeyError"
+        elif "operationalerror" in raw.lower():
+            error_type = "OperationalError"
+        else:
+            error_type = "RuntimeError"
 
     # Determine severity
     raw_lower = raw.lower()
     if any(k in raw_lower for k in ["oomkilled", "fatal", "panic:", "segmentation fault", "critical", "killed"]):
         severity = "CRITICAL"
+    elif any(k in raw_lower for k in ["sawarning", "userwarning", "deprecationwarning"]) and not any(k in raw_lower for k in ["traceback", "fatal", "exception"]):
+        severity = "MEDIUM"
     elif any(k in raw_lower for k in ["error", "exception", "traceback", "500"]):
         severity = "HIGH"
     else:

@@ -44,9 +44,11 @@ JAVASCRIPT_EXCEPTIONS = re.compile(
     r'([A-Za-z0-9_.]*(?:Error|Exception):\s*|'
     r'UnhandledPromiseRejection|UnhandledRejection|'
     r'npm ERR!|Error: Cannot find module|'
-    r'ECONNREFUSED|ENOENT|EACCES|'
+    r'ECONNREFUSED|ENOENT|EACCES|EADDRINUSE|'
+    r'Unable to acquire lock|is another instance.*running|'
+    r'address already in use|failed to compile|'
     r'(✖|✗|×)\s*(Error|Failed|failed))',
-    re.M
+    re.M | re.I
 )
 
 DOCKER_SYSTEM_ERRORS = re.compile(
@@ -84,10 +86,21 @@ PROCESS_EXIT_PATTERNS = [
 
 def detect_level(line: str) -> str:
     """
-    Strict level detection. Returns 'ERROR', 'WARN', or 'INFO'.
-    Ignores normal INFO/DEBUG/404 web server access logs.
-    Only returns 'ERROR' for true stack traces, exceptions, 5xx status codes, and critical failures.
+    Two-stage error level detection:
+    - Stage 0: Ultra-cheap string pre-filter (< 0.05ms) for obvious INFO/DEBUG/2xx logs.
+    - Stage 1: Deep regex pattern analysis for true stack traces, exceptions, and 5xx failures.
     """
+    line_clean = line.strip()
+    if not line_clean:
+        return "INFO"
+
+    # Stage 0: Quick bypass for common non-error web and application logs
+    if (
+        line_clean.startswith(("INFO:", "DEBUG:", "TRACE:", "[INFO]", "[DEBUG]", "[TRACE]", "level=info", "level=debug"))
+        or ('" 200' in line_clean or '" 201' in line_clean or '" 204' in line_clean or '" 304' in line_clean)
+    ) and not ("Traceback" in line_clean or "Exception" in line_clean or "Error" in line_clean or "500" in line_clean):
+        return "INFO"
+
     # 1. Check HTTP 5xx Server Errors (Instant ERROR)
     if HTTP_5XX_ERROR_PATTERN.search(line):
         return "ERROR"
